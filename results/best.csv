@@ -1,0 +1,13 @@
+data_source,location,month,best_share_by_gain,gain_egp_per_household_at_best,balanced_shares,crossover_share,crossover_level
+pvgis,alexandria,1,0.4,0.473805,,0.510606,0.36502
+pvgis,alexandria,4,0.2,1.16768,,0.177701,0.723789
+pvgis,alexandria,7,0.2,1.66046,,0.228965,0.755509
+pvgis,alexandria,10,0.3,1.194305,,0.297502,0.635592
+pvgis,cairo,1,0.3,0.672155,,0.341886,0.433312
+pvgis,cairo,4,0.3,1.446825,,0.257788,0.636371
+pvgis,cairo,7,0.4,2.072725,,0.450125,0.625704
+pvgis,cairo,10,0.3,1.63972,,0.407093,0.572748
+pvgis,new-valley,1,0.15,1.10209,,0.157433,0.668671
+pvgis,new-valley,4,0.3,1.65585,,0.2732,0.648882
+pvgis,new-valley,7,0.4,2.21401,,0.553714,0.594492
+pvgis,new-valley,10,0.3,1.74756,,0.442876,0.539977

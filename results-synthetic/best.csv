@@ -1,0 +1,13 @@
+data_source,location,month,best_share_by_gain,gain_egp_per_household_at_best,balanced_shares,crossover_share,crossover_level
+synthetic,alexandria,1,0.3,0.716267,,0.359556,0.501232
+synthetic,alexandria,4,0.2,1.160933,,0.205161,0.662719
+synthetic,alexandria,7,0.4,2.109833,,0.445549,0.650102
+synthetic,alexandria,10,0.3,0.9286,,0.290961,0.562595
+synthetic,cairo,1,0.3,0.712167,,0.356578,0.496429
+synthetic,cairo,4,0.3,1.167833,,0.22318,0.64192
+synthetic,cairo,7,0.4,2.074333,,0.466162,0.631245
+synthetic,cairo,10,0.3,0.941167,,0.312081,0.539318
+synthetic,new-valley,1,0.3,0.777967,,0.300795,0.539386
+synthetic,new-valley,4,0.3,1.4203,,0.275931,0.638948
+synthetic,new-valley,7,0.4,2.167867,,0.519648,0.603883
+synthetic,new-valley,10,0.3,1.161533,,0.362996,0.54981

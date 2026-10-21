@@ -7,7 +7,8 @@
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "fetch-pvgis": "tsx scripts/fetch-pvgis.ts"
+    "fetch-pvgis": "tsx scripts/fetch-pvgis.ts",
+    "experiment": "tsx scripts/run-experiment.ts"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",
