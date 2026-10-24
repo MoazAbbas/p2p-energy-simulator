@@ -18,11 +18,12 @@
  *
  * Tariff defaults are PLACEHOLDERS until the official Egyptian figures are looked up.
  */
-import { Engine, tradeAmount, type EngineConfig, type EngineEvent, type Trade } from "../../engine/src/engine";
+import { Engine, tradeAmount, type CancelResult, type EngineConfig, type EngineEvent, type SubmitResult, type Trade } from "../../engine/src/engine";
 import type { Agent } from "./agents";
-import { DEFAULT_LOAD_PARAMS, householdDay, type LoadParams } from "./household";
+import { DEFAULT_LOAD_PARAMS, householdDay, type HouseholdDay, type LoadParams } from "./household";
+import { HourMarket } from "./hourmarket";
 import type { DayProfile } from "./pvgis";
-import { shuffleInPlace, type Rng } from "./rng";
+import type { Rng } from "./rng";
 
 export interface Tariff {
   /** piastres per kWh paid when buying from the utility (the price ceiling) */
@@ -154,50 +155,93 @@ interface Acc {
   received: number;
 }
 
-const clamp01 = (v: number): number => Math.min(1, Math.max(0, v));
+export interface HourBand {
+  gridUp: boolean;
+  /** what a household pays the utility per kWh this hour (the outage ceiling when the grid is down) */
+  buyPrice: number;
+  /** what the utility pays for exported energy per kWh (0 when the grid is down) */
+  exportPrice: number;
+  /** price band for bots: [lo, hi] */
+  lo: number;
+  hi: number;
+}
 
-export function simulateDay(
-  agentsIn: readonly Agent[],
-  day: DayProfile,
-  cfg: MarketConfig,
-  rng: Rng,
-  loadParams: LoadParams = DEFAULT_LOAD_PARAMS,
-): DayResult {
-  validateMarket(cfg);
-  // Learning state is private to this run: the caller's agents are never modified.
-  const agents = agentsIn.map((a) => ({ ...a, buyer: { ...a.buyer }, seller: { ...a.seller } }));
-  const n = agents.length;
-  const households = agents.map((a) => householdDay(a.spec, day, loadParams));
-  const idToIndex = new Map(agents.map((a, i) => [a.id, i] as const));
-  const r = cfg.tariff.retail;
-  const e = cfg.tariff.export;
-  const trading = new Set(cfg.tradingHours);
-  const outageHours = new Set(cfg.outage?.hours ?? []);
-  const hiOutage = Math.round((r * (cfg.outage?.ceilingMultiplierPermille ?? 1000)) / 1000);
+/**
+ * The accounting of one simulated day: households, the three baselines, per-hour logs and day totals.
+ * simulateDay drives it hour by hour with in-process engines; the live session drives it with a real-time clock.
+ */
+export class DaySim {
+  readonly cfg: MarketConfig;
+  readonly date: string;
+  readonly agents: Agent[];
+  readonly households: HouseholdDay[];
+  readonly hours: HourLog[] = [];
+  private readonly acc: Acc[];
+  private readonly trading: Set<number>;
+  private readonly outageHours: Set<number>;
+  private readonly hiOutage: number;
+  private sumQ = 0;
+  private sumPQ = 0;
+  private sumP2Q = 0;
+  private gridImportWh = 0;
+  private gridExportWh = 0;
+  private gridImportWhB = 0;
+  private gridExportWhB = 0;
+  private unservedWh = 0;
 
-  const acc: Acc[] = agents.map(() => ({ costA: 0, costB: 0, costC: 0, boughtWh: 0, soldWh: 0, paid: 0, received: 0 }));
-  const hours: HourLog[] = [];
-  let sumQ = 0;
-  let sumPQ = 0;
-  let sumP2Q = 0;
-  let gridImportWh = 0;
-  let gridExportWh = 0;
-  let gridImportWhB = 0;
-  let gridExportWhB = 0;
-  let unservedWh = 0;
+  constructor(agentsIn: readonly Agent[], day: DayProfile, cfg: MarketConfig, loadParams: LoadParams = DEFAULT_LOAD_PARAMS) {
+    validateMarket(cfg);
+    this.cfg = cfg;
+    this.date = day.date;
+    // Learning state is private to this run: the caller's agents are never modified.
+    this.agents = agentsIn.map((a) => ({ ...a, buyer: { ...a.buyer }, seller: { ...a.seller } }));
+    this.households = this.agents.map((a) => householdDay(a.spec, day, loadParams));
+    this.trading = new Set(cfg.tradingHours);
+    this.outageHours = new Set(cfg.outage?.hours ?? []);
+    this.hiOutage = Math.round((cfg.tariff.retail * (cfg.outage?.ceilingMultiplierPermille ?? 1000)) / 1000);
+    this.acc = this.agents.map(() => ({ costA: 0, costB: 0, costC: 0, boughtWh: 0, soldWh: 0, paid: 0, received: 0 }));
+  }
 
-  for (let h = 0; h < 24; h++) {
-    const gridUp = !outageHours.has(h);
-    const buyPrice = gridUp ? r : hiOutage;
-    const exportPrice = gridUp ? e : 0;
-    const lo = gridUp ? e : 1;
-    const hi = gridUp ? r : hiOutage;
+  isTrading(h: number): boolean {
+    return this.trading.has(h);
+  }
 
-    const boughtH: number[] = new Array<number>(n).fill(0);
-    const soldH: number[] = new Array<number>(n).fill(0);
-    const paidH: number[] = new Array<number>(n).fill(0);
-    const receivedH: number[] = new Array<number>(n).fill(0);
+  band(h: number): HourBand {
+    const gridUp = !this.outageHours.has(h);
+    const r = this.cfg.tariff.retail;
+    const e = this.cfg.tariff.export;
+    return {
+      gridUp,
+      buyPrice: gridUp ? r : this.hiOutage,
+      exportPrice: gridUp ? e : 0,
+      lo: gridUp ? e : 1,
+      hi: gridUp ? r : this.hiOutage,
+    };
+  }
 
+  /** Bots for a trading hour. `externalIds` are agents that act from outside (the live human). */
+  openMarket(h: number, externalIds?: ReadonlySet<string>): HourMarket {
+    const b = this.band(h);
+    return new HourMarket({
+      agents: this.agents,
+      households: this.households,
+      hour: h,
+      lo: b.lo,
+      hi: b.hi,
+      learningNoise: this.cfg.learningNoise,
+      externalIds,
+      collectTrades: this.cfg.collectTrades === true,
+    });
+  }
+
+  /**
+   * Settles hour h for every household (market trades, then the utility for the rest) and logs it.
+   * Hours must be finished in order 0..23. `market` is null for hours without a market.
+   */
+  finishHour(h: number, market: HourMarket | null, record?: { engineConfig: EngineConfig; events: EngineEvent[] }): HourLog {
+    if (this.hours.length !== h) throw new Error(`hours must be finished in order: expected ${this.hours.length}, got ${h}`);
+    const n = this.agents.length;
+    const { gridUp, buyPrice, exportPrice } = this.band(h);
     const log: HourLog = {
       hour: h,
       gridUp,
@@ -214,193 +258,147 @@ export function simulateDay(
       curtailedWh: 0,
     };
     for (let i = 0; i < n; i++) {
-      log.surplusWh += households[i]!.surplusWh[h]!;
-      if (agents[i]!.canBuy) log.buyerDemandWh += households[i]!.deficitWh[h]!;
+      log.surplusWh += this.households[i]!.surplusWh[h]!;
+      if (this.agents[i]!.canBuy) log.buyerDemandWh += this.households[i]!.deficitWh[h]!;
+    }
+    if (market !== null) {
+      const st = market.stats;
+      log.tradedWh = st.tradedWh;
+      log.amount = st.amount;
+      log.tradeCount = st.tradeCount;
+      log.minPrice = st.minPrice;
+      log.maxPrice = st.maxPrice;
+      if (st.trades !== undefined) log.trades = st.trades;
+      if (record !== undefined) {
+        log.engineConfig = record.engineConfig;
+        log.events = record.events;
+      }
+      this.sumQ += st.sumQ;
+      this.sumPQ += st.sumPQ;
+      this.sumP2Q += st.sumP2Q;
     }
 
-    if (trading.has(h)) {
-      const sellCaps: Record<string, number> = {};
-      const buyCaps: Record<string, number> = {};
-      const active: number[] = [];
-      for (let i = 0; i < n; i++) {
-        const a = agents[i]!;
-        const s = households[i]!.surplusWh[h]!;
-        const d = households[i]!.deficitWh[h]!;
-        if (s > 0) {
-          const offer = s - Math.floor(s * a.seller.holdBackShare);
-          if (offer > 0) {
-            sellCaps[a.id] = offer;
-            active.push(i);
-          }
-        }
-        if (a.canBuy && d > 0) {
-          buyCaps[a.id] = d;
-          active.push(i);
-        }
-      }
-
-      const engineConfig: EngineConfig = { sellCapsWh: sellCaps, buyCapsWh: buyCaps };
-      const engine = new Engine(engineConfig);
-      const events: EngineEvent[] = [];
-      const record = cfg.recordEvents === true;
-      const openOrder = new Map<number, { orderId: string; price: number }>();
-      const doneWh = new Map<number, number>();
-      let orderCounter = 0;
-
-      for (let tick = 0; tick < cfg.ticksPerHour; tick++) {
-        const order = active.slice();
-        shuffleInPlace(rng, order);
-        const filled = new Set<number>();
-
-        for (const i of order) {
-          const a = agents[i]!;
-          const isSeller = sellCaps[a.id] !== undefined;
-          const cap = isSeller ? sellCaps[a.id]! : buyCaps[a.id]!;
-          const remaining = cap - (doneWh.get(i) ?? 0);
-          if (remaining <= 0) continue;
-          const price = Math.round(isSeller ? lo + a.seller.m * (hi - lo) : hi - a.buyer.mu * (hi - lo));
-          const open = openOrder.get(i);
-          if (open !== undefined && open.price === price) continue; // keep time priority
-          if (open !== undefined) {
-            const ev: EngineEvent = { type: "cancel", orderId: open.orderId, participantId: a.id };
-            if (record) events.push(ev);
-            const c = engine.apply(ev);
-            if (!c.ok) throw new Error(`unexpected cancel failure: ${JSON.stringify(c)}`);
-          }
-          const orderId = `h${h}-${++orderCounter}`;
-          const ev: EngineEvent = {
-            type: "submit",
-            order: { orderId, participantId: a.id, side: isSeller ? "sell" : "buy", price, qtyWh: remaining },
-          };
-          if (record) events.push(ev);
-          const res = engine.apply(ev);
-          if (!("trades" in res)) throw new Error(`unexpected submit failure: ${JSON.stringify(res)}`);
-          openOrder.set(i, { orderId, price });
-          for (const t of res.trades) {
-            const bi = idToIndex.get(t.buyerId)!;
-            const si = idToIndex.get(t.sellerId)!;
-            doneWh.set(bi, (doneWh.get(bi) ?? 0) + t.qtyWh);
-            doneWh.set(si, (doneWh.get(si) ?? 0) + t.qtyWh);
-            filled.add(bi);
-            filled.add(si);
-            boughtH[bi]! += t.qtyWh;
-            paidH[bi]! += t.amount;
-            soldH[si]! += t.qtyWh;
-            receivedH[si]! += t.amount;
-            log.tradedWh += t.qtyWh;
-            log.amount += t.amount;
-            log.tradeCount += 1;
-            log.minPrice = log.minPrice === null ? t.price : Math.min(log.minPrice, t.price);
-            log.maxPrice = log.maxPrice === null ? t.price : Math.max(log.maxPrice, t.price);
-            sumQ += t.qtyWh;
-            sumPQ += t.price * t.qtyWh;
-            sumP2Q += t.price * t.price * t.qtyWh;
-            if (cfg.collectTrades) (log.trades ??= []).push(t);
-          }
-        }
-
-        // Learning: shade more after a fill, improve the price after a miss.
-        for (const i of order) {
-          const a = agents[i]!;
-          const isSeller = sellCaps[a.id] !== undefined;
-          const cap = isSeller ? sellCaps[a.id]! : buyCaps[a.id]!;
-          const remaining = cap - (doneWh.get(i) ?? 0);
-          const didFill = filled.has(i);
-          if (!didFill && remaining <= 0) continue;
-          const step = (isSeller ? a.seller.beta : a.buyer.beta) * (1 + cfg.learningNoise * (2 * rng() - 1));
-          if (isSeller) a.seller.m = clamp01(a.seller.m + (didFill ? step : -step));
-          else a.buyer.mu = clamp01(a.buyer.mu + (didFill ? step : -step));
-        }
-      }
-
-      const closeEvent: EngineEvent = { type: "close" };
-      if (record) events.push(closeEvent);
-      engine.apply(closeEvent);
-      if (record) {
-        log.engineConfig = engineConfig;
-        log.events = events;
-      }
-    }
-
-    // Settlement for this hour.
     for (let i = 0; i < n; i++) {
-      const hh = households[i]!;
-      const a = acc[i]!;
+      const hh = this.households[i]!;
+      const a = this.acc[i]!;
       const deficit = hh.deficitWh[h]!;
       const surplus = hh.surplusWh[h]!;
+      const bought = market?.boughtWh[i] ?? 0;
+      const sold = market?.soldWh[i] ?? 0;
+      const paid = market?.paid[i] ?? 0;
+      const received = market?.received[i] ?? 0;
       a.costA += tradeAmount(hh.loadWh[h]!, buyPrice);
       a.costB += tradeAmount(deficit, buyPrice) - tradeAmount(surplus, exportPrice);
-      const buyLeft = deficit - boughtH[i]!;
-      const exportLeft = surplus - soldH[i]!;
-      a.costC += tradeAmount(buyLeft, buyPrice) - tradeAmount(exportLeft, exportPrice) + paidH[i]! - receivedH[i]!;
-      a.boughtWh += boughtH[i]!;
-      a.soldWh += soldH[i]!;
-      a.paid += paidH[i]!;
-      a.received += receivedH[i]!;
+      const buyLeft = deficit - bought;
+      const exportLeft = surplus - sold;
+      a.costC += tradeAmount(buyLeft, buyPrice) - tradeAmount(exportLeft, exportPrice) + paid - received;
+      a.boughtWh += bought;
+      a.soldWh += sold;
+      a.paid += paid;
+      a.received += received;
       if (gridUp) {
         log.gridImportWh += buyLeft;
         log.gridExportWh += exportLeft;
-        gridImportWhB += deficit;
-        gridExportWhB += surplus;
+        this.gridImportWhB += deficit;
+        this.gridExportWhB += surplus;
       } else {
         log.unservedWh += buyLeft;
         log.curtailedWh += exportLeft;
       }
     }
-    gridImportWh += log.gridImportWh;
-    gridExportWh += log.gridExportWh;
-    unservedWh += log.unservedWh;
-    hours.push(log);
+    this.gridImportWh += log.gridImportWh;
+    this.gridExportWh += log.gridExportWh;
+    this.unservedWh += log.unservedWh;
+    this.hours.push(log);
+    return log;
   }
 
-  const agentResults: AgentResult[] = agents.map((a, i) => ({
-    id: a.id,
-    kind: a.kind,
-    pvKwp: a.spec.pvKwp,
-    generationWh: households[i]!.totals.generationWh,
-    surplusWh: households[i]!.totals.surplusWh,
-    deficitWh: households[i]!.totals.deficitWh,
-    boughtWh: acc[i]!.boughtWh,
-    soldWh: acc[i]!.soldWh,
-    paid: acc[i]!.paid,
-    received: acc[i]!.received,
-    costA: acc[i]!.costA,
-    costB: acc[i]!.costB,
-    costC: acc[i]!.costC,
-    premium: acc[i]!.costB - acc[i]!.costC,
-  }));
+  /** Per-household results so far (final once all 24 hours are finished). */
+  agentResults(): AgentResult[] {
+    return this.agents.map((a, i) => ({
+      id: a.id,
+      kind: a.kind,
+      pvKwp: a.spec.pvKwp,
+      generationWh: this.households[i]!.totals.generationWh,
+      surplusWh: this.households[i]!.totals.surplusWh,
+      deficitWh: this.households[i]!.totals.deficitWh,
+      boughtWh: this.acc[i]!.boughtWh,
+      soldWh: this.acc[i]!.soldWh,
+      paid: this.acc[i]!.paid,
+      received: this.acc[i]!.received,
+      costA: this.acc[i]!.costA,
+      costB: this.acc[i]!.costB,
+      costC: this.acc[i]!.costC,
+      premium: this.acc[i]!.costB - this.acc[i]!.costC,
+    }));
+  }
 
-  let surplusTrading = 0;
-  let demandTrading = 0;
-  let tradedWh = 0;
-  let amount = 0;
-  let tradeCount = 0;
-  for (const l of hours) {
-    tradedWh += l.tradedWh;
-    amount += l.amount;
-    tradeCount += l.tradeCount;
-    if (trading.has(l.hour)) {
-      surplusTrading += l.surplusWh;
-      demandTrading += l.buyerDemandWh;
+  result(): DayResult {
+    if (this.hours.length !== 24) throw new Error("the day is not finished");
+    const r = this.cfg.tariff.retail;
+    const e = this.cfg.tariff.export;
+    const agentResults = this.agentResults();
+    let surplusTrading = 0;
+    let demandTrading = 0;
+    let tradedWh = 0;
+    let amount = 0;
+    let tradeCount = 0;
+    for (const l of this.hours) {
+      tradedWh += l.tradedWh;
+      amount += l.amount;
+      tradeCount += l.tradeCount;
+      if (this.trading.has(l.hour)) {
+        surplusTrading += l.surplusWh;
+        demandTrading += l.buyerDemandWh;
+      }
     }
+    const { sumQ, sumPQ, sumP2Q } = this;
+    const vwap = sumQ > 0 ? sumPQ / sumQ : null;
+    const metrics: DayMetrics = {
+      tradedWh,
+      amount,
+      tradeCount,
+      surplusSoldShare: surplusTrading > 0 ? tradedWh / surplusTrading : null,
+      demandCoveredShare: demandTrading > 0 ? tradedWh / demandTrading : null,
+      totalGain: agentResults.reduce((s, a) => s + a.premium, 0),
+      vwap,
+      pricePosition: vwap !== null && r > e ? (vwap - e) / (r - e) : null,
+      priceStdDev: vwap !== null ? Math.sqrt(Math.max(0, sumP2Q / sumQ - vwap * vwap)) : null,
+      gridImportWh: this.gridImportWh,
+      gridExportWh: this.gridExportWh,
+      gridImportWhB: this.gridImportWhB,
+      gridExportWhB: this.gridExportWhB,
+      unservedWh: this.unservedWh,
+    };
+    return { date: this.date, agents: agentResults, hours: this.hours, metrics };
   }
-  const vwap = sumQ > 0 ? sumPQ / sumQ : null;
-  const metrics: DayMetrics = {
-    tradedWh,
-    amount,
-    tradeCount,
-    surplusSoldShare: surplusTrading > 0 ? tradedWh / surplusTrading : null,
-    demandCoveredShare: demandTrading > 0 ? tradedWh / demandTrading : null,
-    totalGain: agentResults.reduce((s, a) => s + a.premium, 0),
-    vwap,
-    pricePosition: vwap !== null && r > e ? (vwap - e) / (r - e) : null,
-    priceStdDev: vwap !== null ? Math.sqrt(Math.max(0, sumP2Q / sumQ - vwap * vwap)) : null,
-    gridImportWh,
-    gridExportWh,
-    gridImportWhB,
-    gridExportWhB,
-    unservedWh,
-  };
+}
 
-  return { date: day.date, agents: agentResults, hours, metrics };
+export function simulateDay(
+  agentsIn: readonly Agent[],
+  day: DayProfile,
+  cfg: MarketConfig,
+  rng: Rng,
+  loadParams: LoadParams = DEFAULT_LOAD_PARAMS,
+): DayResult {
+  const sim = new DaySim(agentsIn, day, cfg, loadParams);
+  for (let h = 0; h < 24; h++) {
+    if (!sim.isTrading(h)) {
+      sim.finishHour(h, null);
+      continue;
+    }
+    const market = sim.openMarket(h);
+    const engine = new Engine(market.engineConfig);
+    const events: EngineEvent[] = [];
+    const record = cfg.recordEvents === true;
+    for (let tick = 0; tick < cfg.ticksPerHour; tick++) {
+      const tickEvents = market.runTick(rng, (ev) => engine.apply(ev) as SubmitResult | CancelResult);
+      if (record) events.push(...tickEvents);
+    }
+    const closeEvent: EngineEvent = { type: "close" };
+    if (record) events.push(closeEvent);
+    engine.apply(closeEvent);
+    sim.finishHour(h, market, record ? { engineConfig: market.engineConfig, events } : undefined);
+  }
+  return sim.result();
 }

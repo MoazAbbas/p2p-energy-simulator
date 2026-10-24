@@ -1,0 +1,28 @@
+{
+  "name": "energy-market",
+  "version": "0.1.0",
+  "description": "Simulated P2P energy double auction as Hyperledger Fabric chaincode (rules cda-resting-price-v1)",
+  "main": "dist/index.js",
+  "typings": "dist/index.d.ts",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "set -x && fabric-chaincode-node start",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && vitest run",
+    "prepublishOnly": "npm run build"
+  },
+  "engineStrict": true,
+  "license": "Apache-2.0",
+  "dependencies": {
+    "fabric-contract-api": "~2.5",
+    "fabric-shim": "~2.5"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.0",
+    "typescript": "~5.8",
+    "vitest": "^2.1.9"
+  }
+}
